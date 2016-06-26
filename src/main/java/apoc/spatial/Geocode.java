@@ -50,9 +50,11 @@ public class Geocode {
         private static long lastCallTime = 0L;
         private static long DEFAULT_THROTTLE = 5*1000;  // 5 seconds
         private static long MAX_THROTTLE = 60 * 60 * 1000;  // 1 hour
+        private Log log;
 
-        public Throttler(KernelTransaction kernelTransaction, long throttle) {
+        public Throttler(KernelTransaction kernelTransaction, long throttle, Log log) {
             this.kernelTransaction = kernelTransaction;
+            this.log = log;
 
             throttle = Math.min(throttle, MAX_THROTTLE);
             if (throttle < 0) throttle = DEFAULT_THROTTLE;
@@ -66,6 +68,7 @@ public class Geocode {
                 try {
                     if (kernelTransaction.shouldBeTerminated()) return;
                     long msToWait = throttleInMs - msSinceLastCall;
+                    log.debug("apoc.spatial.geocode: throttling calls to geocode service for " + msToWait + "ms");
                     Thread.sleep(Math.min(msToWait, 1000));
                 } catch (InterruptedException e) {
                     // ignore
@@ -83,9 +86,11 @@ public class Geocode {
         private Throttler throttler;
         private String configBase;
         private String urlTemplate;
+        private Log log;
 
-        public SupplierWithKey(Map<String, Object> config, KernelTransaction kernelTransaction, String provider) {
+        public SupplierWithKey(Map<String, Object> config, KernelTransaction kernelTransaction, Log log, String provider) {
             this.configBase = provider;
+            this.log = log;
 
             if (!config.containsKey(configKey("url"))) {
                 throw new IllegalArgumentException("Missing 'url' for geocode provider: " + provider);
@@ -99,13 +104,14 @@ public class Geocode {
             String key = config.get(configKey("key")).toString();
             urlTemplate = urlTemplate.replace("KEY", key);
 
-            this.throttler = new Throttler(kernelTransaction, toLong(ApocConfiguration.get(configKey("throttle"), Throttler.DEFAULT_THROTTLE)));
+            this.throttler = new Throttler(kernelTransaction, toLong(ApocConfiguration.get(configKey("throttle"), Throttler.DEFAULT_THROTTLE)), log);
         }
 
         @SuppressWarnings("unchecked")
         public Stream<GeoCodeResult> geocode(String address, long maxResults) {
             throttler.waitForThrottle();
             String url = urlTemplate.replace("PLACE", Util.encodeUrlComponent(address));
+            log.info("apoc.spatial.geocode: " + url);
             Object value = JsonUtil.loadJson(url);
             if (value instanceof List) {
                 return findResults((List<Map<String, Object>>) value, maxResults);
@@ -150,15 +156,19 @@ public class Geocode {
     private static class OSMSupplier implements GeocodeSupplier {
         public static final String OSM_URL = "http://nominatim.openstreetmap.org/search.php?format=json&q=";
         private Throttler throttler;
+        private Log log;
 
-        public OSMSupplier(Map<String, Object> config,KernelTransaction kernelTransaction) {
-            this.throttler = new Throttler(kernelTransaction, toLong(config.getOrDefault("osm.throttle", Throttler.DEFAULT_THROTTLE)));
+        public OSMSupplier(Map<String, Object> config,KernelTransaction kernelTransaction, Log log) {
+            this.throttler = new Throttler(kernelTransaction, toLong(config.getOrDefault("osm.throttle", Throttler.DEFAULT_THROTTLE)), log);
+            this.log = log;
         }
 
         @SuppressWarnings("unchecked")
         public Stream<GeoCodeResult> geocode(String address, long maxResults) {
             throttler.waitForThrottle();
-            Object value = JsonUtil.loadJson(OSM_URL + Util.encodeUrlComponent(address));
+            String url = OSM_URL + Util.encodeUrlComponent(address);
+            log.info("apoc.spatial.geocode: " + url);
+            Object value = JsonUtil.loadJson(url);
             if (value instanceof List) {
                 return ((List<Map<String, Object>>) value).stream().limit(maxResults).map(data ->
                         new GeoCodeResult(toDouble(data.get("lat")), toDouble(data.get("lon")), valueOf(data.get("display_name")), data));
@@ -170,10 +180,12 @@ public class Geocode {
     class GoogleSupplier implements GeocodeSupplier {
         private final Throttler throttler;
         private String baseUrl;
+        private Log log;
 
-        public GoogleSupplier(Map<String, Object> config, KernelTransaction kernelTransaction) {
-            this.throttler = new Throttler(kernelTransaction, toLong(config.getOrDefault("google.throttle", Throttler.DEFAULT_THROTTLE)));
+        public GoogleSupplier(Map<String, Object> config, KernelTransaction kernelTransaction, Log log) {
+            this.throttler = new Throttler(kernelTransaction, toLong(config.getOrDefault("google.throttle", Throttler.DEFAULT_THROTTLE)), log);
             this.baseUrl = String.format("https://maps.googleapis.com/maps/api/geocode/json?%s&address=", credentials(config));
+            this.log = log;
         }
 
         private String credentials(Map<String, Object> config) {
@@ -192,7 +204,9 @@ public class Geocode {
                 return Stream.empty();
             }
             throttler.waitForThrottle();
-            Object value = JsonUtil.loadJson(baseUrl + Util.encodeUrlComponent(address));
+            String url = baseUrl + Util.encodeUrlComponent(address);
+            log.info("apoc.spatial.geocode: " + url);
+            Object value = JsonUtil.loadJson(url);
             if (value instanceof Map) {
                 Object results = ((Map) value).get("results");
                 if (results instanceof List) {
@@ -211,12 +225,12 @@ public class Geocode {
         if (activeConfig.containsKey(GEOCODE_PROVIDER_KEY)) {
             String supplier = activeConfig.get(GEOCODE_PROVIDER_KEY).toString().toLowerCase();
             switch (supplier) {
-                case "google" : return new GoogleSupplier(activeConfig, kernelTransaction);
-                case "osm" : return new OSMSupplier(activeConfig,kernelTransaction);
-                default: return new SupplierWithKey(activeConfig, kernelTransaction, supplier);
+                case "google" : return new GoogleSupplier(activeConfig, kernelTransaction, log);
+                case "osm" : return new OSMSupplier(activeConfig,kernelTransaction, log);
+                default: return new SupplierWithKey(activeConfig, kernelTransaction, log, supplier);
             }
         }
-        return new OSMSupplier(activeConfig,kernelTransaction);
+        return new OSMSupplier(activeConfig,kernelTransaction, log);
     }
 
     @Procedure
