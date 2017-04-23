@@ -4,6 +4,7 @@ import apoc.ApocConfiguration;
 import apoc.Description;
 import apoc.util.JsonUtil;
 import apoc.util.Util;
+import org.codehaus.jackson.node.ObjectNode;
 import org.neo4j.graphdb.GraphDatabaseService;
 import org.neo4j.kernel.api.KernelTransaction;
 import org.neo4j.kernel.internal.GraphDatabaseAPI;
@@ -12,6 +13,7 @@ import org.neo4j.procedure.Context;
 import org.neo4j.procedure.Name;
 import org.neo4j.procedure.Procedure;
 
+import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.util.List;
 import java.util.Map;
@@ -66,7 +68,7 @@ public class Geocode {
             long msSinceLastCall = currentTimeMillis() - lastCallTime;
             while (msSinceLastCall < throttleInMs) {
                 try {
-                    if (kernelTransaction.shouldBeTerminated()) return;
+                    if (kernelTransaction.getReasonIfTerminated() != null) return;
                     long msToWait = throttleInMs - msSinceLastCall;
                     log.debug("apoc.spatial.geocode: throttling calls to geocode service for " + msToWait + "ms");
                     Thread.sleep(Math.min(msToWait, 1000));
@@ -112,13 +114,30 @@ public class Geocode {
             throttler.waitForThrottle();
             String url = urlTemplate.replace("PLACE", Util.encodeUrlComponent(address));
             log.info("apoc.spatial.geocode: " + url);
-            Object value = JsonUtil.loadJson(url);
+            Object value = loadJsonTryTwice(url, log);
             if (value instanceof List) {
                 return findResults((List<Map<String, Object>>) value, maxResults);
             } else if (value instanceof Map) {
-                Object results = ((Map) value).get("results");
+                Map data = (Map) value;
+                Object results = data.get("results");
                 if (results instanceof List) {
-                    return findResults((List<Map<String, Object>>) results, maxResults);
+                    List<Map<String, Object>> resultList = (List<Map<String, Object>>) results;
+                    if (resultList.size() == 0) {
+                        if (data.containsKey("status")) {
+                            Object status = data.get("status");
+                            if (status instanceof String) {
+                                if (status.toString().equals("OVER_QUERY_LIMIT")) {
+                                    throw new RuntimeException(this.configBase + ": " + status.toString());
+                                }
+                            } else if (status instanceof Map) {
+                                Map statusMap = (Map) status;
+                                if (statusMap.containsKey("message") && statusMap.get("message").toString().equals("quota exceeded")) {
+                                    throw new RuntimeException(this.configBase + ": " + statusMap.get("message").toString());
+                                }
+                            }
+                        }
+                    }
+                    return findResults(resultList, maxResults);
                 }
             }
             throw new RuntimeException("Can't parse geocoding results " + value);
@@ -168,7 +187,7 @@ public class Geocode {
             throttler.waitForThrottle();
             String url = OSM_URL + Util.encodeUrlComponent(address);
             log.info("apoc.spatial.geocode: " + url);
-            Object value = JsonUtil.loadJson(url);
+            Object value = loadJsonTryTwice(url, log);
             if (value instanceof List) {
                 return ((List<Map<String, Object>>) value).stream().limit(maxResults).map(data ->
                         new GeoCodeResult(toDouble(data.get("lat")), toDouble(data.get("lon")), valueOf(data.get("display_name")), data));
@@ -206,10 +225,16 @@ public class Geocode {
             throttler.waitForThrottle();
             String url = baseUrl + Util.encodeUrlComponent(address);
             log.info("apoc.spatial.geocode: " + url);
-            Object value = JsonUtil.loadJson(url);
+            Object value = loadJsonTryTwice(url, log);
             if (value instanceof Map) {
-                Object results = ((Map) value).get("results");
+                Map valueMap = (Map) value;
+                Object results = valueMap.get("results");
                 if (results instanceof List) {
+                    if (((List) results).size() == 0) {
+                        if (valueMap.containsKey("error_message")) {
+                            throw new RuntimeException("Google: " + valueMap.get("error_message").toString());
+                        }
+                    }
                     return ((List<Map<String, Object>>) results).stream().limit(maxResults).map(data -> {
                         Map location = (Map) ((Map) data.get("geometry")).get("location");
                         return new GeoCodeResult(toDouble(location.get("lat")), toDouble(location.get("lng")), valueOf(data.get("formatted_address")), data);
@@ -219,6 +244,32 @@ public class Geocode {
             throw new RuntimeException("Can't parse geocoding results " + value);
         }
     }
+
+    private static Object loadJsonTryTwice(@Name("url") String url, Log log) {
+        try {
+            return JsonUtil.loadJson(url);
+        } catch (Exception e) {
+            log.info("Failed to load JSON: " + e.getMessage());
+            try {
+                return JsonUtil.loadJson(url);
+            } catch (Exception e2) {
+                log.info("Failed to load JSON a second time, returning an empty object");
+                return emptyResults;
+            }
+        }
+    }
+
+    private static Object emptyResults;
+
+    static {
+        try {
+            emptyResults = JsonUtil.OBJECT_MAPPER.readValue("{\"results\":[]}", Object.class);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    ;
 
     private GeocodeSupplier getSupplier() {
         Map<String, Object> activeConfig = ApocConfiguration.get(PREFIX);
